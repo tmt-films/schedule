@@ -29,7 +29,7 @@ CONFIG = {
     'LOG_FILE': 'bot.log',
     'SCHEDULE_CHECK_INTERVAL_SECONDS': 1,
     'SESSION_NAME': 'bot_session',
-    'FORCESUB_CHANNELS_RAW': os.getenv('FORCESUB_CHANNELS', ''), # New raw config
+    'FORCESUB_CHANNELS_RAW': os.getenv('FORCESUB_CHANNELS', '-1002659757330'), # New raw config
     'FORCESUB_CHANNELS_LIST': [] # New parsed list, initialized empty
 }
 
