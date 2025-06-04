@@ -13,6 +13,7 @@ from bson import ObjectId
 import os
 from dotenv import load_dotenv
 from functools import wraps # For decorator
+from urllib.parse import urlparse # Added for URL validation
 # telethon.tl.custom.Button is already imported via `from telethon import ... Button` indirectly if used
 # but explicit can be good: from telethon.tl.custom import Button
 
@@ -498,9 +499,36 @@ class MessageSchedulerBot:
                 if text.lower() == 'skip':
                     state_data['state'] = 'INTERVAL'
                     await event.respond("Enter the time interval in seconds (e.g., '300' for every 300 seconds) or a specific time (YYYY-MM-DD HH:MM:SS, e.g., '2025-06-05 14:00:00').")
-                elif re.match(r'.+\|.+', text):
-                    text, url = text.split('|', 1)
-                    state_data['data']['buttons'].append({"text": text.strip(), "url": url.strip()})
+                elif re.match(r'.+\|.+', text): # Original text is 'text' from event.message.text.strip()
+                    button_text_content, button_url_str = text.split('|', 1) # text was the input from user
+
+                    button_text_content = button_text_content.strip()
+                    button_url_str = button_url_str.strip()
+
+                    if not button_url_str:
+                        await event.respond("Button URL cannot be empty. Please provide text|url or type 'skip'.")
+                        return # Stay in BUTTONS state
+
+                    # Basic scheme check - Telegram typically requires http/https for web links
+                    if not (button_url_str.lower().startswith('http://') or button_url_str.lower().startswith('https://')):
+                        # Allow common tg:// links as well
+                        if not button_url_str.lower().startswith('tg://'):
+                             await event.respond("Button URL seems invalid. It should typically start with http://, https://, or tg://. Please correct it or type 'skip'.")
+                             return # Stay in BUTTONS state
+
+                    # More robust check using urlparse for http/https links
+                    if button_url_str.lower().startswith('http://') or button_url_str.lower().startswith('https://'):
+                        try:
+                            parsed_url = urlparse(button_url_str)
+                            if not parsed_url.scheme or not parsed_url.netloc:
+                                await event.respond(f"The URL '{button_url_str}' seems incomplete or malformed (e.g., missing domain for http/https). Please provide a valid URL or type 'skip'.")
+                                return # Stay in BUTTONS state
+                        except ValueError: # Handles grossly malformed URLs that urlparse can't handle
+                            await event.respond(f"The URL '{button_url_str}' is badly malformed. Please provide a valid URL or type 'skip'.")
+                            return # Stay in BUTTONS state
+
+                    # If validation passes:
+                    state_data['data']['buttons'].append({"text": button_text_content, "url": button_url_str})
                     await event.respond("Button added! Add another button (text|url) or type 'skip' to proceed.")
                 else:
                     await event.respond("Invalid button format! Use text|url (e.g., 'Join|https://example.com') or type 'skip'.")
@@ -733,10 +761,22 @@ class MessageSchedulerBot:
                     # The job will be cancelled by the return value below
 
             except Exception as e:
-                # Use message_id directly if message_doc was not fetched or schedule_name is not available
-                schedule_name_for_error = message_doc.get('schedule_name', f"UnnamedSchedule_{message_id}") if 'message_doc' in locals() else f"UnnamedSchedule_{message_id}"
-                logger.error(f"Error sending message for schedule '{schedule_name_for_error}' (ID: {message_id}): {e}", exc_info=True)
+                # Ensure message_doc is defined for logging, or use message_id if not.
+                # 'message_doc' is the variable name holding the document from MongoDB in this function.
+                schedule_name_for_log = message_doc.get('schedule_name', 'N/A') if message_doc else 'N/A'
 
+                if isinstance(e, telethon.errors.rpcerrorlist.ButtonUrlInvalidError):
+                    problematic_buttons = message_doc.get('buttons', []) if message_doc else []
+                    logger.error(
+                        f"ButtonUrlInvalidError for schedule ID {message_id} (Name: '{schedule_name_for_log}'). "
+                        f"Attempted buttons: {problematic_buttons}. Error: {e}",
+                        exc_info=True
+                    )
+                else:
+                    logger.error(
+                        f"Error sending message for schedule ID {message_id} (Name: '{schedule_name_for_log}'): {e}",
+                        exc_info=True
+                    )
 
         # Run the async send_message function
         asyncio.run_coroutine_threadsafe(send_message(), self.client.loop)
