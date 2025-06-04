@@ -14,6 +14,7 @@ import os
 from dotenv import load_dotenv
 from functools import wraps # For decorator
 from urllib.parse import urlparse # Added for URL validation
+from telethon.tl.functions.channels import GetFullChannelRequest # Added
 # telethon.tl.custom.Button is already imported via `from telethon import ... Button` indirectly if used
 # but explicit can be good: from telethon.tl.custom import Button
 
@@ -29,16 +30,54 @@ CONFIG = {
     'LOG_FILE': 'bot.log',
     'SCHEDULE_CHECK_INTERVAL_SECONDS': 1,
     'SESSION_NAME': 'bot_session',
-    'FORCESUB_CHANNELS_RAW': os.getenv('FORCESUB_CHANNELS', '-1002659757330'), # New raw config
+    'FORCESUB_CHANNELS_RAW': os.getenv('FORCESUB_CHANNELS', ''), # New raw config
     'FORCESUB_CHANNELS_LIST': [] # New parsed list, initialized empty
 }
 
 # Parse FORCESUB_CHANNELS_RAW into FORCESUB_CHANNELS_LIST
-if CONFIG['FORCESUB_CHANNELS_RAW']:
-    raw_channels = CONFIG['FORCESUB_CHANNELS_RAW'].split(',')
-    CONFIG['FORCESUB_CHANNELS_LIST'] = [
-        ch.strip() for ch in raw_channels if ch.strip() # Ensure no empty strings if input is like ",channel,"
-    ]
+raw_fsub_str = CONFIG.get('FORCESUB_CHANNELS_RAW', '') # Use .get for safety, though already in CONFIG
+parsed_fsub_list = []
+if raw_fsub_str:
+    channel_entries_str_list = raw_fsub_str.split(',')
+    for entry_str in channel_entries_str_list:
+        entry_str = entry_str.strip()
+        if not entry_str:
+            continue
+
+        parts = entry_str.split('|')
+        # Ensure identifier is not empty after stripping, even if it's the only part
+        identifier = parts[0].strip()
+        if not identifier:
+            logger.warning(f"Skipping fsub channel entry with empty identifier: '{entry_str}'")
+            continue
+
+        pref_title = None
+        prov_link = None
+
+        if len(parts) > 1:
+            pref_title = parts[1].strip()
+            if not pref_title: pref_title = None # Convert empty string to None
+
+        if len(parts) > 2:
+            prov_link_candidate = parts[2].strip()
+            # Basic validation for the provided link
+            if prov_link_candidate and (prov_link_candidate.lower().startswith('http://') or \
+                                       prov_link_candidate.lower().startswith('https://') or \
+                                       prov_link_candidate.lower().startswith('tg://')): # Added tg:// as valid for provided links
+                prov_link = prov_link_candidate
+            elif prov_link_candidate: # If a link was provided but is invalid
+                logger.warning(
+                    f"ForceSub Config: Provided link for identifier '{identifier}' "
+                    f"('{prov_link_candidate}') does not start with http/https or tg://. Ignoring this provided link."
+                )
+
+        parsed_fsub_list.append({
+            'identifier': identifier,
+            'preferred_title': pref_title,
+            'provided_link': prov_link
+        })
+CONFIG['FORCESUB_CHANNELS_LIST'] = parsed_fsub_list
+# The existing logger.info call after this block will now log the list of dicts.
 
 # Decorator Definition
 def require_subscription(func):
@@ -55,7 +94,6 @@ def require_subscription(func):
             return await func(self, event, *args, **kwargs)
 
         user_id = event.sender_id
-        # is_user_subscribed now returns: tuple[bool, list[dict]]
         is_subscribed, missing_channel_details_list = await self.is_user_subscribed(user_id)
 
         if not is_subscribed:
@@ -64,36 +102,80 @@ def require_subscription(func):
                 await event.respond("There was an issue verifying your channel subscription. Please try again later.")
                 return
 
-            response_message = "To use this bot, you are required to subscribe to the following channel(s):\n\n"
+            # Attempt to get bot's username for deep link
+            bot_username_for_link = None
+            try:
+                me = await self.client.get_me()
+                if me and me.username:
+                    bot_username_for_link = me.username
+                else:
+                    logger.error("FSub: Bot username is None or empty, cannot create deep link for Try Again.")
+            except Exception as e_me:
+                logger.error(f"FSub: Could not get bot username for Try Again button: {e_me}")
+
+            user_first_name = "User" # Default
+            if event.sender:
+                user_first_name = event.sender.first_name if event.sender.first_name else "User"
+
+            response_message = (
+                f"👋 Hello {user_first_name},\n\n"
+                "Please join the following channel(s) then click '♻️ Try Again ♻️' or re-send your command:\n\n"
+            )
             generated_buttons = [] # List of button rows
 
             for channel_detail in missing_channel_details_list:
-                # Use title (which defaults to identifier if title fetch failed), then username if available
-                title = channel_detail.get('title', str(channel_detail.get('identifier', 'Unknown Channel')))
-                username = channel_detail.get('username')
+                display_title = channel_detail.get('display_title', str(channel_detail.get('identifier', 'Unknown Channel')))
+                join_url = channel_detail.get('join_url')
 
-                response_message += f"- **{title}**" # Use markdown for bold title
-                if username:
-                    response_message += f" (@{username})\n"
-                    # Create a button row for this specific channel
+                response_message += f"- **{display_title}**\n" # Each channel on a new line, title is bold
+
+                if join_url:
+                    button_title_text = display_title[:40] + '...' if len(display_title) > 43 else display_title
                     generated_buttons.append(
-                        [Button.url(f"Join {title}", f"https://t.me/{username}")]
+                        [Button.url(f"Join {button_title_text}", join_url)]
                     )
-                else:
-                    # If no username, it might be a private channel or public by ID without a direct link.
-                    response_message += " (Please find and join this channel if a link isn't provided elsewhere)\n"
+                # If no join_url, the text message already lists the display_title.
+                # The user needs to find it manually if no link was auto-generated or provided in config.
 
-            response_message += "\nOnce subscribed to all, please try your command again or use the button below."
+            response_message += "\nOnce subscribed to all, please use the button below or try your command again."
 
-            # Add the "Retry" button as the last row
-            generated_buttons.append(
-                [Button.inline("✅ I've Joined / Retry Command", data="fsub_retry")]
+            # "Try Again" Button (Deep Link or Fallback)
+            if bot_username_for_link:
+                try_again_url = f"https://t.me/{bot_username_for_link}?start=fsub_check"
+                generated_buttons.append([Button.url("♻️ Try Again ♻️", try_again_url)])
+                logger.info(f"FSub: Generated deep-link Try Again button for user {user_id}: {try_again_url}")
+            else:
+                # Fallback to the callback button if bot username couldn't be fetched
+                generated_buttons.append([Button.inline("✅ I've Joined / Retry", data="fsub_retry")])
+                logger.warning(f"FSub: Bot username not available. Falling back to callback 'fsub_retry' button for user {user_id}.")
+
+            logger.debug(
+                f"FSub: Attempting to send force subscription prompt to user {user_id}. "
+                f"Message: '{response_message}'. Buttons: {generated_buttons}"
             )
-
             try:
+                # The message with buttons should be sent to the user directly (private message)
+                # event.respond() sends to the chat where the command was issued.
+                # If the command was in a group, this is not ideal for a fsub prompt.
+                # The prompt should ideally always go to the user's PM with the bot.
+                # This requires self.client.send_message(user_id, ...)
+                # However, to stick to the current pattern of event.respond for simplicity in this step:
+                # We assume this decorator might be used on commands that are PM-only,
+                # or the user accepts fsub messages in group context if command was from group.
+                # For a better UX, fsub prompts are best in PM.
+                # If event.is_private is False, we might consider not sending buttons or sending a different message.
+                # For now, keeping event.respond as per existing structure.
                 await event.respond(response_message, buttons=generated_buttons, link_preview=False)
             except Exception as e_resp:
-                logger.error(f"Error sending fsub required message to user {user_id}: {e_resp}", exc_info=True)
+                logger.error(f"Error sending fsub required message to user {user_id} via event.respond: {e_resp}", exc_info=True)
+                # Fallback: try sending to user's PM if event.respond fails and it was a group message
+                if not event.is_private:
+                    try:
+                        logger.info(f"FSub: event.respond failed in group, attempting to send fsub prompt to user {user_id} via PM.")
+                        await self.client.send_message(user_id, response_message, buttons=generated_buttons, link_preview=False)
+                    except Exception as e_pm_send:
+                         logger.error(f"Error sending fsub required message to user {user_id} via PM: {e_pm_send}", exc_info=True)
+
             return  # Stop further processing of the original command
 
         # User is subscribed, proceed with the original function
@@ -233,44 +315,44 @@ class MessageSchedulerBot:
 
         for channel_identifier in required_channels:
             is_member = False
-            # Default channel_info, using identifier as fallback for title
             channel_info = {
-                'identifier': str(channel_identifier), # Store original identifier
-                'title': str(channel_identifier),      # Fallback title
-                'username': None                       # Default username
+                'identifier': str(channel_identifier),
+                'title': str(channel_identifier), # Default/fallback title
+                'username': None
             }
+            target_channel_entity = None # Initialize to ensure it's defined
 
             try:
                 target_channel_entity = await self.client.get_entity(channel_identifier)
-                # Attempt to populate title and username from the fetched entity
                 channel_info['title'] = getattr(target_channel_entity, 'title', str(channel_identifier))
                 if hasattr(target_channel_entity, 'username') and target_channel_entity.username:
                     channel_info['username'] = target_channel_entity.username
-
-                permissions = await self.client.get_permissions(target_channel_entity, user_id)
-
-                # Refined membership check logic
-                if permissions:
-                    # Explicit flags take precedence
-                    if permissions.is_member or permissions.is_creator or permissions.is_admin:
-                        is_member = True
-                    # Fallback: if user can view messages (common for members in public channels/groups)
-                    elif hasattr(permissions, 'view_messages') and permissions.view_messages:
-                         is_member = True
-                    # The isinstance check for specific participant types can be added here if needed,
-                    # for now, is_member, is_creator, is_admin, and view_messages cover many cases.
-                    # Example: or isinstance(permissions, (types.ChannelParticipantAdmin, types.ChannelParticipantCreator, types.ChannelParticipant))
-
-            except telethon.errors.rpcerrorlist.UserNotParticipantError:
-                is_member = False
-                logger.debug(f"User {user_id} is NOT a participant in channel '{channel_identifier}' (UserNotParticipantError). Fetched info: {channel_info}")
             except (ValueError, telethon.errors.rpcerrorlist.ChannelPrivateError, telethon.errors.rpcerrorlist.ChatAdminRequiredError) as e_entity:
-                # Handles malformed identifiers, or bot can't access channel (e.g., private, bot kicked)
                 logger.error(f"Could not resolve or access channel entity '{channel_identifier}' for fsub check: {e_entity}. Using identifier as title. User treated as not subscribed.")
-                # is_member remains False, channel_info uses defaults (identifier as title)
-            except Exception as e:
-                logger.error(f"Unexpected error checking subscription for user {user_id} in channel '{channel_identifier}' (entity info: {channel_info}): {e}", exc_info=True)
-                is_member = False # Default to not subscribed on unexpected error for safety.
+                # target_channel_entity remains None, is_member remains False
+            except Exception as e_get_entity:
+                logger.error(f"Unexpected error during get_entity for '{channel_identifier}': {e_get_entity}", exc_info=True)
+                # target_channel_entity remains None, is_member remains False
+
+            logger.debug(f"FSub: Resolved channel info for identifier '{channel_identifier}': Title='{channel_info['title']}', Username='{channel_info['username']}'")
+
+            if target_channel_entity: # Only attempt to get permissions if we have a valid entity
+                try:
+                    permissions = await self.client.get_permissions(target_channel_entity, user_id)
+                    if permissions:
+                        if permissions.is_member or permissions.is_creator or permissions.is_admin:
+                            is_member = True
+                        elif hasattr(permissions, 'view_messages') and permissions.view_messages:
+                            is_member = True
+                except telethon.errors.rpcerrorlist.UserNotParticipantError:
+                    is_member = False
+                    logger.debug(f"User {user_id} is NOT a participant in channel '{channel_identifier}' (UserNotParticipantError). Resolved info: {channel_info}")
+                except Exception as e_perm:
+                    logger.error(f"Error checking permissions for user {user_id} in channel '{channel_identifier}' (Resolved info: {channel_info}): {e_perm}", exc_info=True)
+                    is_member = False # Default to not subscribed on permission check error
+            else:
+                # If target_channel_entity is None, get_entity failed, so user cannot be a member.
+                is_member = False
 
             if not is_member:
                 missing_subscriptions_details.append(channel_info)
@@ -351,6 +433,22 @@ class MessageSchedulerBot:
 
     @require_subscription
     async def handle_start(self, event):
+        user_id = event.sender_id # For logging or other uses if needed
+        payload = None
+        parts = event.message.text.split(' ', 1)
+        if len(parts) > 1:
+            payload = parts[1].strip() # Ensure payload is stripped
+
+        if payload == "fsub_check":
+            logger.info(f"User {user_id} initiated /start with fsub_check payload after passing subscription check.")
+            # The @require_subscription decorator has already run and confirmed subscription.
+            await event.respond(
+                "✅ Subscription confirmed! You can now use the bot commands.\n"
+                "Try your original command again, or use /help for a list of commands."
+            )
+            return
+
+        # Existing /start message logic (to be executed if no "fsub_check" payload)
         try:
             await event.respond(
                 "Welcome to the Telegram Message Scheduler Bot!\n"
@@ -368,8 +466,11 @@ class MessageSchedulerBot:
                 "Use /help for details."
             )
         except Exception as e:
-            logger.error(f"Error in /start: {e}")
-            await event.respond("An error occurred.")
+            logger.error(f"Error in /start (normal welcome): {e}", exc_info=True)
+            try:
+                await event.respond("An error occurred while trying to show the welcome message.")
+            except Exception:
+                pass # Avoid error loops
 
     @require_subscription
     async def handle_help(self, event):
@@ -487,43 +588,71 @@ class MessageSchedulerBot:
                     await event.respond("Please send a photo/video or type 'skip'.")
 
             elif state_data['state'] == 'BUTTONS':
-                text = event.message.text.strip() if event.message.text else ""
-                if text.lower() == 'skip':
+                full_input_text = event.message.text.strip() if event.message.text else ""
+
+                if full_input_text.lower() == 'skip':
                     state_data['state'] = 'INTERVAL'
                     await event.respond("Enter the time interval in seconds (e.g., '300' for every 300 seconds) or a specific time (YYYY-MM-DD HH:MM:SS, e.g., '2025-06-05 14:00:00').")
-                elif re.match(r'.+\|.+', text): # Original text is 'text' from event.message.text.strip()
-                    button_text_content, button_url_str = text.split('|', 1) # text was the input from user
+                    return
 
-                    button_text_content = button_text_content.strip()
-                    button_url_str = button_url_str.strip()
+                buttons_added_this_turn = 0
+                errors_this_turn = []
+                lines = full_input_text.splitlines()
+                feedback_message_parts = []
 
-                    if not button_url_str:
-                        await event.respond("Button URL cannot be empty. Please provide text|url or type 'skip'.")
-                        return # Stay in BUTTONS state
+                for line_raw in lines:
+                    line = line_raw.strip()
+                    if not line: # Skip empty lines
+                        continue
 
-                    # Basic scheme check - Telegram typically requires http/https for web links
-                    if not (button_url_str.lower().startswith('http://') or button_url_str.lower().startswith('https://')):
-                        # Allow common tg:// links as well
-                        if not button_url_str.lower().startswith('tg://'):
-                             await event.respond("Button URL seems invalid. It should typically start with http://, https://, or tg://. Please correct it or type 'skip'.")
-                             return # Stay in BUTTONS state
+                    if re.match(r'.+\|.+', line):
+                        button_text_content, button_url_str = line.split('|', 1)
+                        button_text_content = button_text_content.strip()
+                        button_url_str = button_url_str.strip()
 
-                    # More robust check using urlparse for http/https links
-                    if button_url_str.lower().startswith('http://') or button_url_str.lower().startswith('https://'):
-                        try:
-                            parsed_url = urlparse(button_url_str)
-                            if not parsed_url.scheme or not parsed_url.netloc:
-                                await event.respond(f"The URL '{button_url_str}' seems incomplete or malformed (e.g., missing domain for http/https). Please provide a valid URL or type 'skip'.")
-                                return # Stay in BUTTONS state
-                        except ValueError: # Handles grossly malformed URLs that urlparse can't handle
-                            await event.respond(f"The URL '{button_url_str}' is badly malformed. Please provide a valid URL or type 'skip'.")
-                            return # Stay in BUTTONS state
+                        error_reason = None
+                        if not button_url_str:
+                            error_reason = "URL cannot be empty."
+                        elif not (button_url_str.lower().startswith('http://') or button_url_str.lower().startswith('https://') or button_url_str.lower().startswith('tg://')):
+                            error_reason = "URL scheme invalid (must be http, https, or tg)."
+                        elif button_url_str.lower().startswith('http://') or button_url_str.lower().startswith('https://'):
+                            try:
+                                parsed_url = urlparse(button_url_str)
+                                if not parsed_url.scheme or not parsed_url.netloc:
+                                    error_reason = "URL incomplete (e.g., missing domain for http/https)."
+                            except ValueError:
+                                error_reason = "URL badly malformed."
 
-                    # If validation passes:
-                    state_data['data']['buttons'].append({"text": button_text_content, "url": button_url_str})
-                    await event.respond("Button added! Add another button (text|url) or type 'skip' to proceed.")
-                else:
-                    await event.respond("Invalid button format! Use text|url (e.g., 'Join|https://example.com') or type 'skip'.")
+                        if error_reason:
+                            errors_this_turn.append(f"Line \"{line_raw}\": {error_reason}")
+                            continue
+
+                        # If validation passes for this line:
+                        state_data['data']['buttons'].append({"text": button_text_content, "url": button_url_str})
+                        buttons_added_this_turn += 1
+                    else: # Line does not match text|url pattern
+                        errors_this_turn.append(f"Line \"{line_raw}\": Invalid format. Use text|url.")
+
+                # Construct feedback message
+                if buttons_added_this_turn > 0:
+                    feedback_message_parts.append(f"{buttons_added_this_turn} button(s) successfully added.")
+
+                if errors_this_turn:
+                    feedback_message_parts.append("Encountered issues with some lines:")
+                    feedback_message_parts.extend(errors_this_turn)
+
+                if not buttons_added_this_turn && not errors_this_turn: # e.g., user sent plain text that wasn't "skip"
+                    feedback_message_parts.append("No valid buttons found in your message. Please use 'text|url' format (one per line), or type 'skip'.")
+                elif not buttons_added_this_turn && errors_this_turn : # All lines had errors
+                     feedback_message_parts.append("No buttons were added due to errors.")
+
+
+                if feedback_message_parts: # Only send feedback if there's something to say
+                    await event.respond("\n".join(feedback_message_parts))
+
+                # Follow-up prompt
+                await event.respond("You can add more buttons (one per line: text|url), or type 'skip' to proceed.")
+                # State remains 'BUTTONS'
 
             elif state_data['state'] == 'INTERVAL':
                 text = event.message.text.strip() if event.message.text else ""
