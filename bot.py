@@ -12,6 +12,9 @@ import re
 from bson import ObjectId
 import os
 from dotenv import load_dotenv
+from functools import wraps # For decorator
+# telethon.tl.custom.Button is already imported via `from telethon import ... Button` indirectly if used
+# but explicit can be good: from telethon.tl.custom import Button
 
 load_dotenv()
 CONFIG = {
@@ -24,8 +27,77 @@ CONFIG = {
     'MONGODB_TIMEOUT_MS': 5000,
     'LOG_FILE': 'bot.log',
     'SCHEDULE_CHECK_INTERVAL_SECONDS': 1,
-    'SESSION_NAME': 'bot_session'
+    'SESSION_NAME': 'bot_session',
+    'FORCESUB_CHANNELS_RAW': os.getenv('FORCESUB_CHANNELS', ''), # New raw config
+    'FORCESUB_CHANNELS_LIST': [] # New parsed list, initialized empty
 }
+
+# Parse FORCESUB_CHANNELS_RAW into FORCESUB_CHANNELS_LIST
+if CONFIG['FORCESUB_CHANNELS_RAW']:
+    raw_channels = CONFIG['FORCESUB_CHANNELS_RAW'].split(',')
+    CONFIG['FORCESUB_CHANNELS_LIST'] = [
+        ch.strip() for ch in raw_channels if ch.strip() # Ensure no empty strings if input is like ",channel,"
+    ]
+
+# Decorator Definition
+def require_subscription(func):
+    @wraps(func)
+    async def wrapper(self, event, *args, **kwargs):
+        # `self` is the MessageSchedulerBot instance
+        # `event` is the Telethon event object
+
+        # Ensure event has sender_id; typically true for messages bot acts upon.
+        # For channel posts without sender_id, this check might not be relevant,
+        # but commands usually come from users.
+        if not hasattr(event, 'sender_id') or not event.sender_id:
+            logger.warning("Could not get valid sender_id from event for fsub check. Allowing.")
+            return await func(self, event, *args, **kwargs)
+
+        user_id = event.sender_id
+        is_subscribed, missing_channels = await self.is_user_subscribed(user_id)
+
+        if not is_subscribed:
+            if not missing_channels:
+                # This case should ideally not be reached if is_user_subscribed works correctly
+                logger.error(f"User {user_id} failed fsub check (is_subscribed=False) but no missing channels were listed. This might indicate an issue in is_user_subscribed or an unexpected state.")
+                await event.respond("There was an issue verifying your channel subscriptions. Please try again later or contact support if this persists.")
+                return
+
+            buttons = []
+            response_message = "To use this bot, you are required to subscribe to the following channel(s):\n\n"
+
+            for channel_identifier in missing_channels:
+                channel_name = str(channel_identifier) # Default to the identifier itself
+                channel_url = None
+
+                if isinstance(channel_identifier, str) and channel_identifier.startswith('@'):
+                    channel_name = channel_identifier # Already user-friendly
+                    channel_url = f"https://t.me/{channel_identifier.lstrip('@')}"
+                elif isinstance(channel_identifier, str) and channel_identifier.lstrip('-').isdigit():
+                    # It's a numerical ID. We can't easily form a direct t.me link for private channels
+                    # or get a username without another API call.
+                    # We could try to get entity here for a better name, but adds complexity.
+                    # For now, just list it. Admin should ideally use @usernames in config for clickable links.
+                    logger.debug(f"Channel identifier '{channel_identifier}' is numerical. No direct user-clickable link will be generated, listing identifier instead.")
+                    # No specific URL for button for numeric IDs without more info/logic
+
+                response_message += f"- {channel_name}\n"
+
+                if channel_url: # Only add button if we have a good URL
+                     buttons.append([Button.url(f"Join {channel_name}", channel_url)])
+
+            if not buttons and missing_channels:
+                response_message += "\nPlease ensure you have joined them to continue."
+
+            try:
+                await event.respond(response_message, buttons=buttons if buttons else None)
+            except Exception as e_resp:
+                logger.error(f"Error sending fsub required message to user {user_id}: {e_resp}")
+            return  # Stop further processing of the original command
+
+        # User is subscribed, proceed with the original function
+        return await func(self, event, *args, **kwargs)
+    return wrapper
 
 logging.basicConfig(
     level=logging.INFO,
@@ -36,6 +108,9 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
+logger.info(f"Force subscription channels loaded. Raw: '{CONFIG['FORCESUB_CHANNELS_RAW']}', Parsed: {CONFIG['FORCESUB_CHANNELS_LIST']}")
+
 def init_db():
     try:
         client = pymongo.MongoClient(
@@ -58,6 +133,87 @@ class MessageSchedulerBot:
         self.collection = init_db()
         self.user_states = {}  # {user_id: {chat_id, state, data}}
         self.setup_handlers()
+
+    async def is_user_subscribed(self, user_id: int) -> tuple[bool, list[str]]:
+        """
+        Checks if a user is subscribed to all channels specified in CONFIG['FORCESUB_CHANNELS_LIST'].
+
+        Args:
+            user_id: The ID of the user to check.
+
+        Returns:
+            A tuple: (is_subscribed_to_all, list_of_missing_channel_ids_or_usernames)
+            `is_subscribed_to_all` is True if the user is subscribed to all required channels
+            or if no channels are configured.
+            `list_of_missing_channel_ids_or_usernames` contains identifiers of channels
+            the user is not subscribed to.
+        """
+        required_channels = CONFIG['FORCESUB_CHANNELS_LIST']
+        if not required_channels:
+            logger.debug("No force subscription channels configured. Skipping check.")
+            return True, []
+
+        missing_subscriptions = []
+        logger.debug(f"Checking fsub for user {user_id} against channels: {required_channels}")
+
+        for channel_identifier in required_channels:
+            is_member = False
+            try:
+                # Resolve channel username/ID to an entity.
+                # This also checks if the bot can access the channel.
+                target_channel_entity = await self.client.get_entity(channel_identifier)
+
+                # Check user's permissions/status in the channel.
+                # get_permissions is preferred as it directly gives membership status.
+                # It can take user_id directly.
+                permissions = await self.client.get_permissions(target_channel_entity, user_id)
+
+                # In Telethon, participant status can be checked in multiple ways.
+                # If permissions object is returned, check relevant flags.
+                # Being an admin or creator implies membership.
+                if permissions and (permissions.is_member or permissions.is_creator or permissions.is_admin or isinstance(permissions, (types.ChannelParticipantAdmin, types.ChannelParticipantCreator, types.ChannelParticipant))): # Check for specific participant types too
+                     # The above isinstance check might be redundant if is_member covers these, but can be more explicit.
+                     # For basic channels/groups, participant might not have is_member but is still a participant.
+                     # A simpler check might be just to see if get_permissions doesn't error out and user is not banned/restricted.
+                     # For channels, view_messages is a basic permission for members.
+                     if hasattr(permissions, 'view_messages') and permissions.view_messages: # A common permission for members
+                         is_member = True
+                     elif permissions.is_member or permissions.is_creator or permissions.is_admin : # explicit flags
+                         is_member = True
+
+                # If get_permissions returns something that doesn't indicate membership explicitly (e.g. for restricted users)
+                # or if it doesn't error out for non-participants in some contexts, this logic might need refinement based on Telethon version
+                # and specific channel types. UserNotParticipantError is the most direct way to confirm non-membership.
+
+            except telethon.errors.rpcerrorlist.UserNotParticipantError:
+                is_member = False # Explicitly not a participant
+                logger.debug(f"User {user_id} is NOT a participant in channel '{channel_identifier}' (UserNotParticipantError).")
+            except ValueError as ve:
+                # This can happen if channel_identifier is malformed (e.g., not a valid username or ID string)
+                # or if the bot cannot get the entity (e.g., bot kicked from channel, channel deleted, invalid ID type).
+                logger.error(f"Invalid channel identifier '{channel_identifier}' or bot lacks access for fsub check: {ve}. Treating as 'user not subscribed'.")
+                # is_member remains False, channel will be added to missing_subscriptions.
+            except telethon.errors.rpcerrorlist.ChannelPrivateError:
+                logger.error(f"Channel '{channel_identifier}' is private and bot is not a member or lacks permissions for fsub check. Treating as 'user not subscribed'.")
+                # is_member remains False
+            except telethon.errors.rpcerrorlist.ChatAdminRequiredError:
+                logger.error(f"Bot needs to be an admin in '{channel_identifier}' to check user {user_id}'s subscription. Treating as 'user not subscribed'.")
+                # is_member remains False
+            except Exception as e:
+                # Catch-all for other unexpected Telethon errors or issues.
+                logger.error(f"Unexpected error checking subscription for user {user_id} in channel '{channel_identifier}': {e}", exc_info=True)
+                # Default to not subscribed on unexpected error for safety.
+                is_member = False
+
+            if not is_member:
+                missing_subscriptions.append(str(channel_identifier)) # Store the original identifier
+
+        if not missing_subscriptions:
+            logger.info(f"User {user_id} IS SUBSCRIBED to all required channels.")
+            return True, []
+        else:
+            logger.info(f"User {user_id} is MISSING SUBSCRIPTIONS for channels: {missing_subscriptions}")
+            return False, missing_subscriptions
 
     def setup_handlers(self):
         @self.client.on(events.NewMessage(pattern='/start'))
@@ -126,6 +282,7 @@ class MessageSchedulerBot:
             logger.error(f"Error checking admin status for user {user_id}: {e}")
             return False
 
+    @require_subscription
     async def handle_start(self, event):
         try:
             await event.respond(
@@ -147,6 +304,7 @@ class MessageSchedulerBot:
             logger.error(f"Error in /start: {e}")
             await event.respond("An error occurred.")
 
+    @require_subscription
     async def handle_help(self, event):
         try:
             await event.respond(
@@ -180,6 +338,7 @@ class MessageSchedulerBot:
             logger.error(f"Error in /help: {e}")
             await event.respond("An error occurred.")
 
+    @require_subscription
     async def handle_schedule_message_start(self, event):
         chat_id = event.chat_id
         user_id = event.sender_id
@@ -315,6 +474,7 @@ class MessageSchedulerBot:
             logger.error(f"Error in conversation: {e}")
             await event.respond("An error occurred. Please try again.")
 
+    @require_subscription
     async def handle_cancel(self, event):
         user_id = event.sender_id
         try:
@@ -327,6 +487,7 @@ class MessageSchedulerBot:
             logger.error(f"Error in /cancel: {e}")
             await event.respond("An error occurred.")
 
+    @require_subscription
     async def handle_stop_schedule(self, event):
         chat_id = event.chat_id
         user_id = event.sender_id
@@ -382,63 +543,107 @@ class MessageSchedulerBot:
     def send_scheduled_message(self, chat_id, message_id):
         async def send_message():
             try:
-                message = self.collection.find_one({"_id": ObjectId(message_id)})
-                if not message or message.get("sent"):
+                # 1. Retrieve Schedule Details
+                message_doc = self.collection.find_one({"_id": ObjectId(message_id)})
+
+                if not message_doc:
+                    logger.error(f"Schedule document {message_id} not found. Cannot send message.")
                     return
+                if message_doc.get("sent") and not message_doc.get("interval_seconds"): # Already sent one-time message
+                    logger.info(f"One-time message {message_id} already marked as sent. Skipping.")
+                    return schedule.CancelJob # Ensure it's unscheduled if this state is reached
 
+                schedule_name = message_doc.get('schedule_name', f"UnnamedSchedule_{message_id}")
+                last_telegram_id = message_doc.get('last_sent_telegram_message_id')
+
+                # 2. Delete Previous Message (if applicable for this specific schedule document)
+                if last_telegram_id:
+                    try:
+                        logger.info(f"Attempting to delete old message {last_telegram_id} for schedule '{schedule_name}' (ID: {message_id}) in chat {chat_id}")
+                        await self.client.delete_messages(chat_id, last_telegram_id)
+                        logger.info(f"Successfully deleted old message {last_telegram_id} for schedule '{schedule_name}' (ID: {message_id})")
+                    except Exception as e_del:
+                        logger.warning(f"Could not delete old message {last_telegram_id} for schedule '{schedule_name}' (ID: {message_id}) in chat {chat_id}: {e_del}. It might have been deleted already or permissions changed.")
+
+                # Prepare message content (buttons, text)
                 buttons = []
-                if message.get("buttons"):
-                    for btn in message["buttons"]:
-                        buttons.append([Button.url(btn["text"], btn["url"])])
+                if message_doc.get("buttons"):
+                    for btn_data in message_doc["buttons"]:
+                        buttons.append([Button.url(btn_data["text"], btn_data["url"])])
                 keyboard = buttons if buttons else None
+                message_text_content = message_doc.get("message_text", "")
 
-                if message.get("file_id") and message.get("media_type") and message.get("access_hash"):
+                # 3. Send the New Message
+                sent_message_object = None
+                if message_doc.get("file_id") and message_doc.get("media_type") and message_doc.get("access_hash"):
                     media = None
-                    file_id = int(message["file_id"])
-                    access_hash = message["access_hash"]
-                    if message["media_type"] == "photo":
-                        media = InputMediaPhoto(
-                            id=types.InputPhoto(
-                                id=file_id,
-                                access_hash=access_hash,
-                                file_reference=b''
-                            )
+                    file_id = int(message_doc["file_id"]) # Ensure int
+                    access_hash = message_doc["access_hash"] # Ensure correct type if needed by Telethon
+                    file_reference = b'' # Often required, can be empty bytes
+
+                    if message_doc["media_type"] == "photo":
+                        media = types.InputMediaPhoto(
+                            id=types.InputPhoto(id=file_id, access_hash=access_hash, file_reference=file_reference)
                         )
-                    elif message["media_type"] == "video":
-                        media = InputMediaDocument(
-                            id=types.InputDocument(
-                                id=file_id,
-                                access_hash=access_hash,
-                                file_reference=b''
-                            )
+                    elif message_doc["media_type"] == "video":
+                         media = types.InputMediaDocument(
+                            id=types.InputDocument(id=file_id, access_hash=access_hash, file_reference=file_reference)
                         )
+
                     if media:
-                        await self.client.send_message(
+                        sent_message_object = await self.client.send_message(
                             chat_id,
-                            message["message_text"],
+                            message_text_content,
                             file=media,
                             buttons=keyboard
                         )
-                        logger.info(f"Sent {message['media_type']} message {message_id}")
+                        logger.info(f"Sent {message_doc['media_type']} message for schedule '{schedule_name}' (ID: {message_id}) to chat {chat_id}")
                     else:
-                        logger.error(f"Invalid media type for message {message_id}")
-                        return
+                        logger.error(f"Invalid media type or setup for schedule '{schedule_name}' (ID: {message_id})")
+                        return # Stop if media setup is wrong
                 else:
-                    await self.client.send_message(
+                    sent_message_object = await self.client.send_message(
                         chat_id,
-                        message["message_text"],
+                        message_text_content,
                         buttons=keyboard
                     )
-                    logger.info(f"Sent text message {message_id}")
+                    logger.info(f"Sent text message for schedule '{schedule_name}' (ID: {message_id}) to chat {chat_id}")
 
-                if not message.get("interval_seconds"):
-                    self.collection.update_one({"_id": ObjectId(message_id)}, {"$set": {"sent": True}})
+                # 4. Store New Telegram Message ID
+                if sent_message_object:
+                    new_telegram_id = sent_message_object.id
+                    self.collection.update_one(
+                        {"_id": ObjectId(message_id)},
+                        {"$set": {"last_sent_telegram_message_id": new_telegram_id}}
+                    )
+                    logger.info(f"Updated schedule '{schedule_name}' (ID: {message_id}) with new sent Telegram message ID: {new_telegram_id}")
+                else:
+                    logger.warning(f"Did not receive sent_message_object for schedule '{schedule_name}' (ID: {message_id}). Not updating last_sent_telegram_message_id.")
+
+                # 5. Handle one-time messages (mark as sent and unschedule)
+                if not message_doc.get("interval_seconds"):
+                    self.collection.update_one(
+                        {"_id": ObjectId(message_id)},
+                        {"$set": {"sent": True}} # Mark as sent
+                    )
+                    logger.info(f"Marked one-time schedule '{schedule_name}' (ID: {message_id}) as sent.")
+                    # The job will be cancelled by the return value below
+
             except Exception as e:
-                logger.error(f"Error sending message {message_id}: {e}")
+                # Use message_id directly if message_doc was not fetched or schedule_name is not available
+                schedule_name_for_error = message_doc.get('schedule_name', f"UnnamedSchedule_{message_id}") if 'message_doc' in locals() else f"UnnamedSchedule_{message_id}"
+                logger.error(f"Error sending message for schedule '{schedule_name_for_error}' (ID: {message_id}): {e}", exc_info=True)
 
+
+        # Run the async send_message function
         asyncio.run_coroutine_threadsafe(send_message(), self.client.loop)
-        message = self.collection.find_one({"_id": ObjectId(message_id)})
-        if message and not message.get("interval_seconds"):
+
+        # For one-time jobs, determine if they should be cancelled.
+        # This part runs synchronously after scheduling the async task.
+        # It needs to fetch the document again to be sure, or rely on the initial fetch if safe.
+        # To be safe, let's re-fetch, though it's a bit redundant.
+        current_message_doc_for_cancel = self.collection.find_one({"_id": ObjectId(message_id)})
+        if current_message_doc_for_cancel and not current_message_doc_for_cancel.get("interval_seconds"):
             return schedule.CancelJob
         return None
 
