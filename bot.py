@@ -132,7 +132,81 @@ class MessageSchedulerBot:
         self.bot_token = bot_token
         self.collection = init_db()
         self.user_states = {}  # {user_id: {chat_id, state, data}}
+        # Note: load_and_reschedule_jobs should be called after client is ready,
+        # potentially in run() or after client.start(). For now, just defining the method.
         self.setup_handlers()
+
+    async def load_and_reschedule_jobs(self):
+        logger.info("Attempting to load and reschedule pending jobs from database...")
+
+        query = {
+            "$or": [
+                { "interval_seconds": { "$exists": True, "$ne": None } },
+                {
+                    "schedule_time": { "$exists": True, "$ne": None },
+                    "$or": [
+                        { "sent": False },
+                        { "sent": { "$exists": False } }
+                    ]
+                }
+            ]
+        }
+
+        pending_jobs = self.collection.find(query)
+        rescheduled_count = 0
+
+        for job_doc in pending_jobs:
+            chat_id = job_doc.get('chat_id')
+            # Ensure message_db_id is a string, as used in send_scheduled_message tags and calls
+            message_db_id = str(job_doc.get('_id'))
+
+            if not chat_id: # message_db_id should always exist if job_doc comes from MongoDB with _id
+                logger.error(f"Skipping reload of job with DB ID {message_db_id} due to missing chat_id.")
+                continue
+
+            interval = job_doc.get('interval_seconds')
+            time_str = job_doc.get('schedule_time')
+
+            job_rescheduled_successfully = False
+            if interval and isinstance(interval, (int, float)) and interval > 0:
+                try:
+                    schedule.every(interval).seconds.do(
+                        self.send_scheduled_message, chat_id=chat_id, message_id=message_db_id
+                    ).tag(f"message_{message_db_id}")
+                    logger.info(f"Reloaded recurring job for DB ID {message_db_id}, chat {chat_id}, every {interval}s.")
+                    rescheduled_count += 1
+                    job_rescheduled_successfully = True
+                except Exception as e_reschedule_interval:
+                    logger.error(f"Failed to reschedule recurring job DB ID {message_db_id}: {e_reschedule_interval}", exc_info=True)
+
+            elif time_str:
+                try:
+                    scheduled_dt = datetime.strptime(time_str, "%Y-%m-%d %H:%M:%S")
+                    if scheduled_dt < datetime.now():
+                        logger.info(f"Skipping reload of one-time job DB ID {message_db_id} for chat {chat_id} as its schedule time {time_str} is in the past.")
+                        # Optionally mark as sent if it should have been, and if it's not already.
+                        if not job_doc.get("sent"):
+                             self.collection.update_one({"_id": ObjectId(message_db_id)}, {"$set": {"sent": True}})
+                             logger.info(f"Marked past one-time job DB ID {message_db_id} as sent.")
+                        continue
+
+                    schedule_time_only = scheduled_dt.strftime("%H:%M:%S") # Use strftime for safety
+                    schedule.every().day.at(schedule_time_only).do(
+                        self.send_scheduled_message, chat_id=chat_id, message_id=message_db_id
+                    ).tag(f"message_{message_db_id}")
+                    logger.info(f"Reloaded one-time job for DB ID {message_db_id}, chat {chat_id}, at {time_str}.")
+                    rescheduled_count += 1
+                    job_rescheduled_successfully = True
+                except ValueError:
+                    logger.error(f"Invalid time format '{time_str}' for job DB ID {message_db_id}. Skipping reschedule.")
+                except Exception as e_reschedule_specific:
+                    logger.error(f"Failed to reschedule one-time job DB ID {message_db_id}: {e_reschedule_specific}", exc_info=True)
+
+            if not job_rescheduled_successfully and not (interval and isinstance(interval, (int, float)) and interval > 0) and not time_str :
+                 logger.warning(f"Job DB ID {message_db_id} (chat {chat_id}) has neither valid interval nor schedule_time. Skipping.")
+
+        logger.info(f"Successfully reloaded and rescheduled {rescheduled_count} jobs.")
+
 
     async def is_user_subscribed(self, user_id: int) -> tuple[bool, list[str]]:
         """
@@ -699,11 +773,16 @@ class MessageSchedulerBot:
         try:
             await self.client.start(bot_token=self.bot_token)
             logger.info("Bot started successfully")
+
+            # Load and reschedule jobs from database
+            await self.load_and_reschedule_jobs()
+
+            logger.info("Starting main scheduling loop...")
             while True:
                 schedule.run_pending()
                 await asyncio.sleep(CONFIG['SCHEDULE_CHECK_INTERVAL_SECONDS'])
         except Exception as e:
-            logger.error(f"Error in run loop: {e}")
+            logger.error(f"Error in run loop: {e}", exc_info=True)
             raise
 
 if __name__ == "__main__":
