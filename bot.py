@@ -224,6 +224,7 @@ class MessageSchedulerBot:
                     await event.respond("Schedule name cannot be empty!")
                     return
                 state_data['data']['schedule_name'] = schedule_name
+                logger.info(f"Schedule name set for user {user_id}: {schedule_name}") # Added log
                 state_data['state'] = 'MESSAGE_TEXT'
                 await event.respond("Please provide the message text (e.g., 'Team meeting at 2 PM').")
 
@@ -294,6 +295,7 @@ class MessageSchedulerBot:
                 state_data['data']['interval_seconds'] = interval_seconds
                 state_data['data']['schedule_time'] = time_str
 
+                logger.info(f"Attempting to insert schedule for user {user_id}: {state_data['data']}") # Added log
                 result = self.collection.insert_one(state_data['data'])
                 message_id = str(result.inserted_id)
 
@@ -334,10 +336,11 @@ class MessageSchedulerBot:
                 await event.respond("Only group admins can stop schedules!")
                 return
 
-            messages = self.collection.find({"chat_id": chat_id, "sent": False})
+            messages = self.collection.find({"chat_id": chat_id, "sent": False}) # sent: False is okay here for listing stoppable items
             buttons = []
             for msg in messages:
-                buttons.append([Button.inline(f"{msg['schedule_name']} (ID: {msg['_id']})", data=f"stop_{msg['_id']}")])
+                display_name = msg.get('schedule_name', f"Unnamed (ID: {msg['_id']})")
+                buttons.append([Button.inline(f"{display_name} (ID: {msg['_id']})", data=f"stop_{msg['_id']}")])
 
             if not buttons:
                 await event.respond("No scheduled messages to stop.")
@@ -360,13 +363,18 @@ class MessageSchedulerBot:
 
             if data.startswith("stop_"):
                 msg_id = data[5:]
-                result = self.collection.delete_one({"_id": ObjectId(msg_id), "chat_id": chat_id, "sent": False})
+                # Remove sent: False condition, as we want to stop it regardless of its sent status if the job exists.
+                # chat_id is kept for security/scoping.
+                result = self.collection.delete_one({"_id": ObjectId(msg_id), "chat_id": chat_id})
                 if result.deleted_count == 0:
-                    await event.respond("Message ID not found or already sent!")
+                    # This message might need adjustment as "already sent" is no longer the specific check.
+                    # However, if it's not in the DB, it can't be stopped.
+                    await event.respond("Message ID not found in database (perhaps already stopped or never existed).")
                     return
 
-                schedule.clear(f"message_{msg_id}")
-                await event.respond(f"Scheduled message {msg_id} stopped.")
+                schedule.clear(f"message_{msg_id}") # Clear the job from the scheduler
+                logger.info(f"Cleared schedule job for message ID {msg_id} with tag message_{msg_id}")
+                await event.respond(f"Scheduled message {msg_id} stopped and removed.")
         except Exception as e:
             logger.error(f"Error in button click: {e}")
             await event.respond("An error occurred.")
@@ -438,17 +446,42 @@ class MessageSchedulerBot:
         chat_id = event.chat_id
 
         try:
-            messages = self.collection.find({"chat_id": chat_id, "sent": False})
+            messages = self.collection.find({"chat_id": chat_id, "sent": False}) # sent: False is appropriate for listing active/pending schedules
             buttons = []
             response = "Scheduled messages:\n"
+            processed_count = 0
             for msg in messages:
-                time_info = f"Time: {msg['schedule_time']}" if msg.get("schedule_time") else f"Every {msg['interval_seconds']} seconds"
-                media_info = f" | Media: {msg['media_type']}" if msg.get("media_type") else ""
-                buttons_info = f" | Buttons: {', '.join([b['text'] for b in msg.get('buttons', [])])}" if msg.get("buttons") else ""
-                response += f"ID: {msg['_id']} | Name: {msg['schedule_name']} | {time_info} | Message: {msg['message_text']}{media_info}{buttons_info}\n"
-                buttons.append([Button.inline(f"{msg['schedule_name']} (ID: {msg['_id']})", data=f"view_{msg['_id']}")])
+                try:
+                    schedule_name_display = msg.get('schedule_name', f"Unnamed (ID: {msg['_id']})")
 
-            if response == "Scheduled messages:\n":
+                    # Robust time_info
+                    schedule_time = msg.get("schedule_time")
+                    interval_seconds = msg.get("interval_seconds")
+                    if schedule_time:
+                        time_info = f"Time: {schedule_time}"
+                    elif interval_seconds:
+                        time_info = f"Every {interval_seconds} seconds"
+                    else:
+                        time_info = "Time: N/A"
+
+                    media_info = f" | Media: {msg.get('media_type', 'N/A')}" if msg.get("media_type") else ""
+                    buttons_list = msg.get('buttons', [])
+                    buttons_info = f" | Buttons: {', '.join([b.get('text', 'N/A') for b in buttons_list])}" if buttons_list else ""
+
+                    current_msg_response = f"ID: {msg['_id']} | Name: {schedule_name_display} | {time_info} | Message: {msg.get('message_text', 'N/A')}{media_info}{buttons_info}\n"
+                    response += current_msg_response
+                    buttons.append([Button.inline(f"{schedule_name_display} (ID: {msg['_id']})", data=f"view_{msg['_id']}")])
+                    logger.info(f"Processed message for /list: {current_msg_response.strip()}")
+                    processed_count += 1
+                except Exception as e_loop:
+                    logger.error(f"Error processing message {msg.get('_id', 'UNKNOWN_ID')} in /list loop: {e_loop}", exc_info=True)
+                    # Optionally, add a placeholder to the response indicating a message could not be displayed
+                    # response += f"ID: {msg.get('_id', 'UNKNOWN_ID')} | Name: Error displaying this schedule\n"
+
+
+            if processed_count == 0: # Check based on actual processing, not just initial response string
+                await event.respond("No scheduled messages.")
+                return
                 await event.respond("No scheduled messages.")
                 return
 
