@@ -1,24 +1,3 @@
-# Telegram Message Scheduler Bot with Structured Conversation
-# Language: Python
-# Purpose: A bot for Telegram groups to allow admins (including anonymous) to schedule messages with a name, text, optional media (photos/videos), optional buttons, and time intervals (seconds or specific time).
-# Dependencies: telethon, schedule, pymongo, python-dotenv
-# Setup Instructions:
-# 1. Install dependencies: `pip install telethon==1.36.0 schedule==1.2.2 pymongo==4.10.1 python-dotenv==1.0.1`
-# 2. Create a .env file with:
-#    API_ID=your_api_id
-#    API_HASH=your_api_hash
-#    BOT_TOKEN=your_bot_token
-#    MONGODB_URI=mongodb://localhost:27017/
-# 3. Obtain API_ID and API_HASH from https://my.telegram.org/apps.
-# 4. Obtain BOT_TOKEN from BotFather.
-# 5. Ensure MongoDB is running.
-# 6. Add the bot to your Telegram group with permissions to send messages, photos, and videos.
-# 7. Run: `python bot.py`
-# Notes:
-# - Check bot.log for debugging.
-# - Test with regular and anonymous admins.
-# - First run may prompt for authentication.
-
 import telethon
 from telethon import TelegramClient, events, types
 from telethon.tl.custom import Button
@@ -34,10 +13,7 @@ from bson import ObjectId
 import os
 from dotenv import load_dotenv
 
-# Load environment variables
 load_dotenv()
-
-# Configuration Section
 CONFIG = {
     'API_ID': os.getenv('API_ID'),
     'API_HASH': os.getenv('API_HASH'),
@@ -51,7 +27,6 @@ CONFIG = {
     'SESSION_NAME': 'bot_session'
 }
 
-# Set up logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -61,8 +36,6 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
-
-# MongoDB setup
 def init_db():
     try:
         client = pymongo.MongoClient(
@@ -78,7 +51,6 @@ def init_db():
         logger.error(f"Failed to connect to MongoDB: {e}")
         raise SystemExit("MongoDB connection failed. Check MONGODB_URI in .env.")
 
-# Bot class
 class MessageSchedulerBot:
     def __init__(self, api_id, api_hash, bot_token):
         self.client = TelegramClient(CONFIG['SESSION_NAME'], api_id, api_hash)
@@ -108,12 +80,12 @@ class MessageSchedulerBot:
                 logger.error(f"Error in /list: {e}")
                 await event.respond("An error occurred.")
 
-        @self.client.on(events.NewMessage(pattern='/delete'))
-        async def delete_schedule(event):
+        @self.client.on(events.NewMessage(pattern='/stop'))
+        async def stop_schedule(event):
             try:
-                await self.handle_delete_schedule(event)
+                await self.handle_stop_schedule(event)
             except Exception as e:
-                logger.error(f"Error in /delete: {e}")
+                logger.error(f"Error in /stop: {e}")
                 await event.respond("An error occurred.")
 
         @self.client.on(events.NewMessage(pattern='/cancel'))
@@ -122,6 +94,14 @@ class MessageSchedulerBot:
                 await self.handle_cancel(event)
             except Exception as e:
                 logger.error(f"Error in /cancel: {e}")
+                await event.respond("An error occurred.")
+
+        @self.client.on(events.CallbackQuery)
+        async def handle_callback(event):
+            try:
+                await self.handle_button_click(event)
+            except Exception as e:
+                logger.error(f"Error in callback: {e}")
                 await event.respond("An error occurred.")
 
         @self.client.on(events.NewMessage)
@@ -154,13 +134,13 @@ class MessageSchedulerBot:
                 "Key features:\n"
                 "- Schedule messages with a name, text, optional media, and buttons.\n"
                 "- Set repeating intervals (seconds) or specific times.\n"
-                "- Only admins can schedule or delete messages.\n"
+                "- Only admins can schedule or stop messages.\n"
                 "Commands:\n"
                 "- /schedule_message: Set up a message (guided process).\n"
-                "- /list: View all scheduled messages.\n"
-                "- /delete <id>: Delete a scheduled message.\n"
-                "- /help: Get detailed instructions.\n"
+                "- /list: View all scheduled messages as buttons.\n"
+                "- /stop: Stop a scheduled message (admin only).\n"
                 "- /cancel: Cancel the scheduling process.\n"
+                "- /help: Get detailed instructions.\n"
                 "Use /help for details."
             )
         except Exception as e:
@@ -189,11 +169,11 @@ class MessageSchedulerBot:
                 "- Interval: '300' (every 300 seconds) or '2025-06-05 14:00:00'\n"
                 "Commands:\n"
                 "- /schedule_message: Start scheduling.\n"
-                "- /list: Show scheduled messages.\n"
-                "- /delete <id>: Delete a message (admin only).\n"
+                "- /list: Show scheduled messages as buttons.\n"
+                "- /stop: Stop a scheduled message (admin only).\n"
                 "- /cancel: Cancel scheduling.\n"
                 "Notes:\n"
-                "- Only admins can use /schedule_message and /delete.\n"
+                "- Only admins can use /schedule_message and /stop.\n"
                 f"Check {CONFIG['LOG_FILE']} for issues."
             )
         except Exception as e:
@@ -345,6 +325,52 @@ class MessageSchedulerBot:
             logger.error(f"Error in /cancel: {e}")
             await event.respond("An error occurred.")
 
+    async def handle_stop_schedule(self, event):
+        chat_id = event.chat_id
+        user_id = event.sender_id
+
+        try:
+            if not await self.is_admin(user_id, chat_id):
+                await event.respond("Only group admins can stop schedules!")
+                return
+
+            messages = self.collection.find({"chat_id": chat_id, "sent": False})
+            buttons = []
+            for msg in messages:
+                buttons.append([Button.inline(f"{msg['schedule_name']} (ID: {msg['_id']})", data=f"stop_{msg['_id']}")])
+
+            if not buttons:
+                await event.respond("No scheduled messages to stop.")
+                return
+
+            await event.respond("Select a schedule to stop:", buttons=buttons)
+        except Exception as e:
+            logger.error(f"Error in /stop: {e}")
+            await event.respond("An error occurred.")
+
+    async def handle_button_click(self, event):
+        user_id = event.sender_id
+        chat_id = event.chat_id
+        data = event.data.decode('utf-8')
+
+        try:
+            if not await self.is_admin(user_id, chat_id):
+                await event.respond("Only group admins can stop schedules!")
+                return
+
+            if data.startswith("stop_"):
+                msg_id = data[5:]
+                result = self.collection.delete_one({"_id": ObjectId(msg_id), "chat_id": chat_id, "sent": False})
+                if result.deleted_count == 0:
+                    await event.respond("Message ID not found or already sent!")
+                    return
+
+                schedule.clear(f"message_{msg_id}")
+                await event.respond(f"Scheduled message {msg_id} stopped.")
+        except Exception as e:
+            logger.error(f"Error in button click: {e}")
+            await event.respond("An error occurred.")
+
     def send_scheduled_message(self, chat_id, message_id):
         async def send_message():
             try:
@@ -413,45 +439,22 @@ class MessageSchedulerBot:
 
         try:
             messages = self.collection.find({"chat_id": chat_id, "sent": False})
+            buttons = []
             response = "Scheduled messages:\n"
             for msg in messages:
                 time_info = f"Time: {msg['schedule_time']}" if msg.get("schedule_time") else f"Every {msg['interval_seconds']} seconds"
                 media_info = f" | Media: {msg['media_type']}" if msg.get("media_type") else ""
                 buttons_info = f" | Buttons: {', '.join([b['text'] for b in msg.get('buttons', [])])}" if msg.get("buttons") else ""
                 response += f"ID: {msg['_id']} | Name: {msg['schedule_name']} | {time_info} | Message: {msg['message_text']}{media_info}{buttons_info}\n"
+                buttons.append([Button.inline(f"{msg['schedule_name']} (ID: {msg['_id']})", data=f"view_{msg['_id']}")])
 
             if response == "Scheduled messages:\n":
                 await event.respond("No scheduled messages.")
                 return
-            await event.respond(response)
+
+            await event.respond(response, buttons=buttons)
         except Exception as e:
             logger.error(f"Error in /list: {e}")
-            await event.respond("An error occurred.")
-
-    async def handle_delete_schedule(self, event):
-        chat_id = event.chat_id
-        user_id = event.sender_id
-        args = event.message.text.split()[1:] if event.message.text else []
-
-        try:
-            if not await self.is_admin(user_id, chat_id):
-                await event.respond("Only group admins can delete messages!")
-                return
-
-            if not args:
-                await event.respond("Usage: /delete <id>")
-                return
-
-            msg_id = args[0]
-            result = self.collection.delete_one({"_id": ObjectId(msg_id), "chat_id": chat_id, "sent": False})
-            if result.deleted_count == 0:
-                await event.respond("Message ID not found or already sent!")
-                return
-
-            schedule.clear(f"message_{msg_id}")
-            await event.respond(f"Scheduled message {msg_id} deleted.")
-        except Exception as e:
-            logger.error(f"Error in /delete: {e}")
             await event.respond("An error occurred.")
 
     async def run(self):
@@ -465,7 +468,6 @@ class MessageSchedulerBot:
             logger.error(f"Error in run loop: {e}")
             raise
 
-# Main execution
 if __name__ == "__main__":
     try:
         if not CONFIG['BOT_TOKEN'] or CONFIG['BOT_TOKEN'] == "YOUR_TELEGRAM_BOT_TOKEN":
