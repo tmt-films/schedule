@@ -294,6 +294,34 @@ class MessageSchedulerBot:
                 state_data['data']['interval_seconds'] = interval_seconds
                 state_data['data']['schedule_time'] = time_str
 
+                # Check for existing schedules with the same name in the same chat
+                new_schedule_name = state_data['data']['schedule_name']
+                current_chat_id = state_data['data']['chat_id']
+
+                existing_schedules_cursor = self.collection.find({
+                    "schedule_name": new_schedule_name,
+                    "chat_id": current_chat_id,
+                    "sent": {"$ne": True}
+                })
+                schedules_to_delete = list(existing_schedules_cursor)
+
+                if schedules_to_delete:
+                    logger.info(f"Found {len(schedules_to_delete)} existing schedule(s) with name '{new_schedule_name}' in chat {current_chat_id} that will be overwritten.")
+                    for sched_to_del in schedules_to_delete:
+                        old_message_id = str(sched_to_del['_id'])
+                        logger.info(f"Deleting old schedule '{new_schedule_name}' (ID: {old_message_id}) in chat {current_chat_id}.")
+
+                        # Clear from schedule library
+                        schedule.clear(f"message_{old_message_id}")
+
+                        # Delete from MongoDB
+                        # sched_to_del['_id'] is already an ObjectId from the find query
+                        delete_result = self.collection.delete_one({"_id": sched_to_del['_id']})
+                        if delete_result.deleted_count:
+                            logger.info(f"Successfully deleted schedule ID {old_message_id} from MongoDB.")
+                        else:
+                            logger.warning(f"Could not find schedule ID {old_message_id} in MongoDB for deletion, though it was initially found. It might have been deleted by another process.")
+
                 result = self.collection.insert_one(state_data['data'])
                 message_id = str(result.inserted_id)
 
