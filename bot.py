@@ -55,45 +55,45 @@ def require_subscription(func):
             return await func(self, event, *args, **kwargs)
 
         user_id = event.sender_id
-        is_subscribed, missing_channels = await self.is_user_subscribed(user_id)
+        # is_user_subscribed now returns: tuple[bool, list[dict]]
+        is_subscribed, missing_channel_details_list = await self.is_user_subscribed(user_id)
 
         if not is_subscribed:
-            if not missing_channels:
-                # This case should ideally not be reached if is_user_subscribed works correctly
-                logger.error(f"User {user_id} failed fsub check (is_subscribed=False) but no missing channels were listed. This might indicate an issue in is_user_subscribed or an unexpected state.")
-                await event.respond("There was an issue verifying your channel subscriptions. Please try again later or contact support if this persists.")
+            if not missing_channel_details_list: # Defensive check
+                logger.error(f"User {user_id} failed fsub check (is_subscribed=False) but no missing channels details listed. This might indicate an issue in is_user_subscribed.")
+                await event.respond("There was an issue verifying your channel subscription. Please try again later.")
                 return
 
-            buttons = []
             response_message = "To use this bot, you are required to subscribe to the following channel(s):\n\n"
+            generated_buttons = [] # List of button rows
 
-            for channel_identifier in missing_channels:
-                channel_name = str(channel_identifier) # Default to the identifier itself
-                channel_url = None
+            for channel_detail in missing_channel_details_list:
+                # Use title (which defaults to identifier if title fetch failed), then username if available
+                title = channel_detail.get('title', str(channel_detail.get('identifier', 'Unknown Channel')))
+                username = channel_detail.get('username')
 
-                if isinstance(channel_identifier, str) and channel_identifier.startswith('@'):
-                    channel_name = channel_identifier # Already user-friendly
-                    channel_url = f"https://t.me/{channel_identifier.lstrip('@')}"
-                elif isinstance(channel_identifier, str) and channel_identifier.lstrip('-').isdigit():
-                    # It's a numerical ID. We can't easily form a direct t.me link for private channels
-                    # or get a username without another API call.
-                    # We could try to get entity here for a better name, but adds complexity.
-                    # For now, just list it. Admin should ideally use @usernames in config for clickable links.
-                    logger.debug(f"Channel identifier '{channel_identifier}' is numerical. No direct user-clickable link will be generated, listing identifier instead.")
-                    # No specific URL for button for numeric IDs without more info/logic
+                response_message += f"- **{title}**" # Use markdown for bold title
+                if username:
+                    response_message += f" (@{username})\n"
+                    # Create a button row for this specific channel
+                    generated_buttons.append(
+                        [Button.url(f"Join {title}", f"https://t.me/{username}")]
+                    )
+                else:
+                    # If no username, it might be a private channel or public by ID without a direct link.
+                    response_message += " (Please find and join this channel if a link isn't provided elsewhere)\n"
 
-                response_message += f"- {channel_name}\n"
+            response_message += "\nOnce subscribed to all, please try your command again or use the button below."
 
-                if channel_url: # Only add button if we have a good URL
-                     buttons.append([Button.url(f"Join {channel_name}", channel_url)])
-
-            if not buttons and missing_channels:
-                response_message += "\nPlease ensure you have joined them to continue."
+            # Add the "Retry" button as the last row
+            generated_buttons.append(
+                [Button.inline("✅ I've Joined / Retry Command", data="fsub_retry")]
+            )
 
             try:
-                await event.respond(response_message, buttons=buttons if buttons else None)
+                await event.respond(response_message, buttons=generated_buttons, link_preview=False)
             except Exception as e_resp:
-                logger.error(f"Error sending fsub required message to user {user_id}: {e_resp}")
+                logger.error(f"Error sending fsub required message to user {user_id}: {e_resp}", exc_info=True)
             return  # Stop further processing of the original command
 
         # User is subscribed, proceed with the original function
@@ -209,7 +209,7 @@ class MessageSchedulerBot:
         logger.info(f"Successfully reloaded and rescheduled {rescheduled_count} jobs.")
 
 
-    async def is_user_subscribed(self, user_id: int) -> tuple[bool, list[str]]:
+    async def is_user_subscribed(self, user_id: int) -> tuple[bool, list[dict]]:
         """
         Checks if a user is subscribed to all channels specified in CONFIG['FORCESUB_CHANNELS_LIST'].
 
@@ -217,78 +217,70 @@ class MessageSchedulerBot:
             user_id: The ID of the user to check.
 
         Returns:
-            A tuple: (is_subscribed_to_all, list_of_missing_channel_ids_or_usernames)
+            A tuple: (is_subscribed_to_all, list_of_missing_channel_details)
             `is_subscribed_to_all` is True if the user is subscribed to all required channels
             or if no channels are configured.
-            `list_of_missing_channel_ids_or_usernames` contains identifiers of channels
-            the user is not subscribed to.
+            `list_of_missing_channel_details` contains dictionaries with details of channels
+            the user is not subscribed to (identifier, title, username).
         """
         required_channels = CONFIG['FORCESUB_CHANNELS_LIST']
         if not required_channels:
             logger.debug("No force subscription channels configured. Skipping check.")
             return True, []
 
-        missing_subscriptions = []
+        missing_subscriptions_details = [] # New list name
         logger.debug(f"Checking fsub for user {user_id} against channels: {required_channels}")
 
         for channel_identifier in required_channels:
             is_member = False
-            try:
-                # Resolve channel username/ID to an entity.
-                # This also checks if the bot can access the channel.
-                target_channel_entity = await self.client.get_entity(channel_identifier)
+            # Default channel_info, using identifier as fallback for title
+            channel_info = {
+                'identifier': str(channel_identifier), # Store original identifier
+                'title': str(channel_identifier),      # Fallback title
+                'username': None                       # Default username
+            }
 
-                # Check user's permissions/status in the channel.
-                # get_permissions is preferred as it directly gives membership status.
-                # It can take user_id directly.
+            try:
+                target_channel_entity = await self.client.get_entity(channel_identifier)
+                # Attempt to populate title and username from the fetched entity
+                channel_info['title'] = getattr(target_channel_entity, 'title', str(channel_identifier))
+                if hasattr(target_channel_entity, 'username') and target_channel_entity.username:
+                    channel_info['username'] = target_channel_entity.username
+
                 permissions = await self.client.get_permissions(target_channel_entity, user_id)
 
-                # In Telethon, participant status can be checked in multiple ways.
-                # If permissions object is returned, check relevant flags.
-                # Being an admin or creator implies membership.
-                if permissions and (permissions.is_member or permissions.is_creator or permissions.is_admin or isinstance(permissions, (types.ChannelParticipantAdmin, types.ChannelParticipantCreator, types.ChannelParticipant))): # Check for specific participant types too
-                     # The above isinstance check might be redundant if is_member covers these, but can be more explicit.
-                     # For basic channels/groups, participant might not have is_member but is still a participant.
-                     # A simpler check might be just to see if get_permissions doesn't error out and user is not banned/restricted.
-                     # For channels, view_messages is a basic permission for members.
-                     if hasattr(permissions, 'view_messages') and permissions.view_messages: # A common permission for members
+                # Refined membership check logic
+                if permissions:
+                    # Explicit flags take precedence
+                    if permissions.is_member or permissions.is_creator or permissions.is_admin:
+                        is_member = True
+                    # Fallback: if user can view messages (common for members in public channels/groups)
+                    elif hasattr(permissions, 'view_messages') and permissions.view_messages:
                          is_member = True
-                     elif permissions.is_member or permissions.is_creator or permissions.is_admin : # explicit flags
-                         is_member = True
-
-                # If get_permissions returns something that doesn't indicate membership explicitly (e.g. for restricted users)
-                # or if it doesn't error out for non-participants in some contexts, this logic might need refinement based on Telethon version
-                # and specific channel types. UserNotParticipantError is the most direct way to confirm non-membership.
+                    # The isinstance check for specific participant types can be added here if needed,
+                    # for now, is_member, is_creator, is_admin, and view_messages cover many cases.
+                    # Example: or isinstance(permissions, (types.ChannelParticipantAdmin, types.ChannelParticipantCreator, types.ChannelParticipant))
 
             except telethon.errors.rpcerrorlist.UserNotParticipantError:
-                is_member = False # Explicitly not a participant
-                logger.debug(f"User {user_id} is NOT a participant in channel '{channel_identifier}' (UserNotParticipantError).")
-            except ValueError as ve:
-                # This can happen if channel_identifier is malformed (e.g., not a valid username or ID string)
-                # or if the bot cannot get the entity (e.g., bot kicked from channel, channel deleted, invalid ID type).
-                logger.error(f"Invalid channel identifier '{channel_identifier}' or bot lacks access for fsub check: {ve}. Treating as 'user not subscribed'.")
-                # is_member remains False, channel will be added to missing_subscriptions.
-            except telethon.errors.rpcerrorlist.ChannelPrivateError:
-                logger.error(f"Channel '{channel_identifier}' is private and bot is not a member or lacks permissions for fsub check. Treating as 'user not subscribed'.")
-                # is_member remains False
-            except telethon.errors.rpcerrorlist.ChatAdminRequiredError:
-                logger.error(f"Bot needs to be an admin in '{channel_identifier}' to check user {user_id}'s subscription. Treating as 'user not subscribed'.")
-                # is_member remains False
-            except Exception as e:
-                # Catch-all for other unexpected Telethon errors or issues.
-                logger.error(f"Unexpected error checking subscription for user {user_id} in channel '{channel_identifier}': {e}", exc_info=True)
-                # Default to not subscribed on unexpected error for safety.
                 is_member = False
+                logger.debug(f"User {user_id} is NOT a participant in channel '{channel_identifier}' (UserNotParticipantError). Fetched info: {channel_info}")
+            except (ValueError, telethon.errors.rpcerrorlist.ChannelPrivateError, telethon.errors.rpcerrorlist.ChatAdminRequiredError) as e_entity:
+                # Handles malformed identifiers, or bot can't access channel (e.g., private, bot kicked)
+                logger.error(f"Could not resolve or access channel entity '{channel_identifier}' for fsub check: {e_entity}. Using identifier as title. User treated as not subscribed.")
+                # is_member remains False, channel_info uses defaults (identifier as title)
+            except Exception as e:
+                logger.error(f"Unexpected error checking subscription for user {user_id} in channel '{channel_identifier}' (entity info: {channel_info}): {e}", exc_info=True)
+                is_member = False # Default to not subscribed on unexpected error for safety.
 
             if not is_member:
-                missing_subscriptions.append(str(channel_identifier)) # Store the original identifier
+                missing_subscriptions_details.append(channel_info)
 
-        if not missing_subscriptions:
+        if not missing_subscriptions_details:
             logger.info(f"User {user_id} IS SUBSCRIBED to all required channels.")
             return True, []
         else:
-            logger.info(f"User {user_id} is MISSING SUBSCRIPTIONS for channels: {missing_subscriptions}")
-            return False, missing_subscriptions
+            logger.info(f"User {user_id} is MISSING SUBSCRIPTIONS for channels: {missing_subscriptions_details}")
+            return False, missing_subscriptions_details
 
     def setup_handlers(self):
         @self.client.on(events.NewMessage(pattern='/start'))
@@ -645,31 +637,88 @@ class MessageSchedulerBot:
 
     async def handle_button_click(self, event):
         user_id = event.sender_id
+        # chat_id from event might be the user's PM if the fsub message was sent there,
+        # or group chat if the button (like stop) originated from a group message.
         chat_id = event.chat_id
         data = event.data.decode('utf-8')
 
         try:
-            if not await self.is_admin(user_id, chat_id):
-                await event.respond("Only group admins can stop schedules!")
-                return
-
             if data.startswith("stop_"):
-                msg_id = data[5:]
-                # Remove sent: False condition, as we want to stop it regardless of its sent status if the job exists.
-                # chat_id is kept for security/scoping.
-                result = self.collection.delete_one({"_id": ObjectId(msg_id), "chat_id": chat_id})
-                if result.deleted_count == 0:
-                    # This message might need adjustment as "already sent" is no longer the specific check.
-                    # However, if it's not in the DB, it can't be stopped.
-                    await event.respond("Message ID not found in database (perhaps already stopped or never existed).")
+                # Admin check specifically for the stop action
+                if not await self.is_admin(user_id, chat_id): # chat_id here is where the /list or /stop command was issued
+                    await event.answer("Only group admins can perform this action!", alert=True)
                     return
 
-                schedule.clear(f"message_{msg_id}") # Clear the job from the scheduler
-                logger.info(f"Cleared schedule job for message ID {msg_id} with tag message_{msg_id}")
-                await event.respond(f"Scheduled message {msg_id} stopped and removed.")
+                msg_id_to_stop = data[5:]
+                # Remove sent: False condition, as we want to stop it regardless of its sent status if the job exists.
+                # chat_id is kept for security/scoping.
+                result = self.collection.delete_one({"_id": ObjectId(msg_id_to_stop), "chat_id": chat_id})
+                if result.deleted_count == 0:
+                    await event.edit("Message ID not found in database (perhaps already stopped or never existed).", buttons=None)
+                    return
+
+                schedule.clear(f"message_{msg_id_to_stop}") # Clear the job from the scheduler
+                logger.info(f"Cleared schedule job for message ID {msg_id_to_stop} with tag message_{msg_id_to_stop}")
+                await event.edit(f"Scheduled message ID `{msg_id_to_stop}` stopped and removed.", buttons=None)
+                # Using event.edit to change the original message (e.g. the /list message)
+
+            elif data == "fsub_retry":
+                logger.info(f"User {user_id} clicked 'fsub_retry'. Re-checking subscriptions.")
+
+                try:
+                    # Delete the message that contained the "Retry" button
+                    await event.delete()
+                except Exception as e_del_prompt:
+                    logger.warning(f"Could not delete fsub_retry prompt for user {user_id}: {e_del_prompt}")
+
+                is_subscribed, missing_channel_details_list = await self.is_user_subscribed(user_id)
+
+                if is_subscribed:
+                    # Send a new message to the user (PM)
+                    await self.client.send_message(user_id, "✅ Subscription confirmed! You can now try your original command again.")
+                else:
+                    # Re-generate the "please subscribe" message
+                    response_message = "It seems you are still not subscribed to all required channel(s):\n\n"
+                    generated_buttons = []
+
+                    if not missing_channel_details_list: # Should ideally not happen
+                         response_message = "There was an issue re-checking your subscriptions. Please try the command again."
+                    else:
+                        for channel_detail in missing_channel_details_list:
+                            title = channel_detail.get('title', str(channel_detail.get('identifier', 'Unknown Channel')))
+                            username = channel_detail.get('username')
+                            response_message += f"- **{title}**"
+                            if username:
+                                response_message += f" (@{username})\n"
+                                generated_buttons.append([Button.url(f"Join {title}", f"https://t.me/{username}")])
+                            else:
+                                response_message += " (Please find and join this channel)\n"
+                        response_message += "\nOnce subscribed to all, please click the button below."
+
+                    generated_buttons.append([Button.inline("✅ I've Joined / Retry", data="fsub_retry")])
+
+                    # Send a new message to the user (PM)
+                    await self.client.send_message(user_id, response_message, buttons=generated_buttons, link_preview=False)
+                return # Explicitly return after handling fsub_retry to avoid falling into generic event.answer
+
         except Exception as e:
-            logger.error(f"Error in button click: {e}")
-            await event.respond("An error occurred.")
+            logger.error(f"Error in handle_button_click for data '{data}': {e}", exc_info=True)
+            try:
+                # Try to inform user about general error via answer, then respond if that fails
+                await event.answer("An error occurred while processing this action.", alert=True)
+            except Exception: # If event.answer fails (e.g. callback expired)
+                 if event.is_private : # Only send message if it's a PM context
+                    await self.client.send_message(user_id, "An error occurred. Please try again.")
+
+        # Default event.answer() if no other response has been sent by event.edit or event.respond by this point
+        # This is mainly for buttons that don't send new messages or edit their own message.
+        # fsub_retry and stop_ actions already send/edit messages.
+        if not (data.startswith("stop_") or data == "fsub_retry"):
+            try:
+                await event.answer()
+            except telethon.errors.rpcerrorlist.CallbackQueryIdInvalidError:
+                 pass # Callback ID might be invalid if already processed or message deleted, ignore.
+
 
     def send_scheduled_message(self, chat_id, message_id):
         async def send_message():
