@@ -294,6 +294,34 @@ class MessageSchedulerBot:
                 state_data['data']['interval_seconds'] = interval_seconds
                 state_data['data']['schedule_time'] = time_str
 
+                # Check for existing schedules with the same name in the same chat
+                new_schedule_name = state_data['data']['schedule_name']
+                current_chat_id = state_data['data']['chat_id']
+
+                existing_schedules_cursor = self.collection.find({
+                    "schedule_name": new_schedule_name,
+                    "chat_id": current_chat_id,
+                    "sent": {"$ne": True}
+                })
+                schedules_to_delete = list(existing_schedules_cursor)
+
+                if schedules_to_delete:
+                    logger.info(f"Found {len(schedules_to_delete)} existing schedule(s) with name '{new_schedule_name}' in chat {current_chat_id} that will be overwritten.")
+                    for sched_to_del in schedules_to_delete:
+                        old_message_id = str(sched_to_del['_id'])
+                        logger.info(f"Deleting old schedule '{new_schedule_name}' (ID: {old_message_id}) in chat {current_chat_id}.")
+
+                        # Clear from schedule library
+                        schedule.clear(f"message_{old_message_id}")
+
+                        # Delete from MongoDB
+                        # sched_to_del['_id'] is already an ObjectId from the find query
+                        delete_result = self.collection.delete_one({"_id": sched_to_del['_id']})
+                        if delete_result.deleted_count:
+                            logger.info(f"Successfully deleted schedule ID {old_message_id} from MongoDB.")
+                        else:
+                            logger.warning(f"Could not find schedule ID {old_message_id} in MongoDB for deletion, though it was initially found. It might have been deleted by another process.")
+
                 result = self.collection.insert_one(state_data['data'])
                 message_id = str(result.inserted_id)
 
@@ -457,10 +485,78 @@ class MessageSchedulerBot:
             logger.error(f"Error in /list: {e}")
             await event.respond("An error occurred.")
 
+    async def reload_schedules_from_db(self):
+        logger.info("Attempting to reload schedules from database...")
+        # The query should find documents where 'sent' is not True (i.e., False or non-existent)
+        pending_schedules_cursor = self.collection.find({"sent": {"$ne": True}})
+
+        schedules_to_reload = []
+        # Iterate using an async for loop if the driver supports it,
+        # otherwise, convert cursor to list (may be memory intensive for large datasets)
+        # For pymongo, direct iteration is synchronous.
+        # If an async driver like motor is used, an async for loop would be appropriate here.
+        # Since we are using pymongo, a simple loop is fine, but the method is async
+        # to allow for potential async operations within the loop in the future (e.g., re-scheduling).
+        for schedule_doc in pending_schedules_cursor.to_list(length=None): # Use to_list for async compatibility if needed by driver
+            schedules_to_reload.append(schedule_doc)
+
+        if schedules_to_reload:
+            logger.info(f"Found {len(schedules_to_reload)} schedule(s) to reload.")
+            for schedule_doc in schedules_to_reload:
+                logger.debug(f"Attempting to re-schedule: {schedule_doc}")
+                message_id = str(schedule_doc['_id'])
+                chat_id = schedule_doc['chat_id'] # Assuming chat_id is stored in the document
+                schedule_name = schedule_doc.get('schedule_name', 'Unnamed Schedule')
+
+                interval_seconds = schedule_doc.get("interval_seconds")
+                schedule_time_str = schedule_doc.get("schedule_time")
+
+                if interval_seconds and isinstance(interval_seconds, (int, float)) and interval_seconds > 0:
+                    interval = int(interval_seconds)
+                    schedule.every(interval).seconds.do(
+                        self.send_scheduled_message, chat_id=chat_id, message_id=message_id
+                    ).tag(f"message_{message_id}")
+                    logger.info(f"Reloaded interval job for schedule '{schedule_name}' (ID: {message_id}) to run every {interval} seconds.")
+                elif schedule_time_str:
+                    try:
+                        parsed_schedule_time = datetime.strptime(schedule_time_str, "%Y-%m-%d %H:%M:%S")
+                        if parsed_schedule_time < datetime.now():
+                            logger.warning(f"Schedule '{schedule_name}' (ID: {message_id}) with time {schedule_time_str} is in the past. Skipping re-schedule and marking as sent.")
+                            self.collection.update_one({"_id": schedule_doc['_id']}, {"$set": {"sent": True}})
+                            continue
+                        else:
+                            job_time_str = parsed_schedule_time.strftime("%H:%M:%S")
+                            # For specific date scheduling, we might need to adjust how schedule.every().day.at() is used,
+                            # as it schedules for that time *every day*.
+                            # A more robust solution for future specific date-times would involve checking the date within send_scheduled_message
+                            # or using a library that supports one-off future jobs more directly if schedule doesn't handle it well for multi-day futures.
+                            # For now, adhering to the existing logic pattern from handle_conversation:
+                            schedule.every().day.at(job_time_str).do(
+                                self.send_scheduled_message, chat_id=chat_id, message_id=message_id
+                            ).tag(f"message_{message_id}")
+                            logger.info(f"Reloaded specific time job for schedule '{schedule_name}' (ID: {message_id}) for {schedule_time_str}.")
+                            # Note: This will make it run daily at that time until 'sent' is true.
+                            # If it's truly one-time, send_scheduled_message should ensure it's marked 'sent' and cancels the job.
+                    except ValueError:
+                        logger.error(f"Invalid date format for schedule '{schedule_name}' (ID: {message_id}): {schedule_time_str}. Cannot reload.")
+                    except Exception as e:
+                        logger.error(f"Error processing schedule_time for '{schedule_name}' (ID: {message_id}): {e}")
+                else:
+                    logger.warning(f"Schedule '{schedule_name}' (ID: {message_id}) has no valid interval_seconds or schedule_time. Cannot reload.")
+        else:
+            logger.info("No pending schedules found in the database to reload.")
+        # Return the list of schedules for now, as it might be useful for testing or direct inspection
+        return schedules_to_reload
+
     async def run(self):
         try:
             await self.client.start(bot_token=self.bot_token)
             logger.info("Bot started successfully")
+
+            # Reload schedules from the database
+            await self.reload_schedules_from_db()
+
+            logger.info("Starting schedule polling loop...")
             while True:
                 schedule.run_pending()
                 await asyncio.sleep(CONFIG['SCHEDULE_CHECK_INTERVAL_SECONDS'])
