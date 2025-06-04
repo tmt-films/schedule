@@ -571,14 +571,43 @@ class MessageSchedulerBot:
                 await event.respond("Only group admins can stop schedules!")
                 return
 
-            messages = self.collection.find({"chat_id": chat_id, "sent": False}) # sent: False is okay here for listing stoppable items
-            buttons = []
-            for msg in messages:
-                display_name = msg.get('schedule_name', f"Unnamed (ID: {msg['_id']})")
-                buttons.append([Button.inline(f"{display_name} (ID: {msg['_id']})", data=f"stop_{msg['_id']}")])
+            query = {
+                "chat_id": chat_id,
+                "$or": [
+                    { "interval_seconds": { "$exists": True, "$ne": None, "$gt": 0 } },
+                    {
+                        "schedule_time": { "$exists": True, "$ne": None },
+                        "$or": [
+                            { "sent": False },
+                            { "sent": { "$exists": False } }
+                        ]
+                    }
+                ]
+            }
+            messages_cursor = self.collection.find(query)
 
-            if not buttons:
-                await event.respond("No scheduled messages to stop.")
+            buttons = []
+            # Convert cursor to list to process it, as we need to check if it's empty.
+            messages_list = list(messages_cursor)
+
+            if not messages_list:
+                await event.respond("No active schedules to stop.")
+                return
+
+            for msg_doc in messages_list:
+                msg_id_str = str(msg_doc.get('_id'))
+                schedule_name_for_button = msg_doc.get('schedule_name', f"ID {msg_id_str}")
+
+                max_button_text_len = 30 # Consistent with handle_list_schedules
+                button_text = f"Stop: {schedule_name_for_button}"
+                if len(button_text) > max_button_text_len:
+                    button_text = button_text[:max_button_text_len-3] + "..."
+
+                buttons.append([Button.inline(button_text, data=f"stop_{msg_id_str}")])
+
+            # This check is now implicitly handled by checking messages_list earlier.
+            # if not buttons:
+            #     await event.respond("No scheduled messages to stop.")
                 return
 
             await event.respond("Select a schedule to stop:", buttons=buttons)
@@ -721,53 +750,105 @@ class MessageSchedulerBot:
             return schedule.CancelJob
         return None
 
+    @require_subscription
     async def handle_list_schedules(self, event):
         chat_id = event.chat_id
+        user_id = event.sender_id # Get sender_id for admin check
 
         try:
-            messages = self.collection.find({"chat_id": chat_id, "sent": False}) # sent: False is appropriate for listing active/pending schedules
-            buttons = []
-            response = "Scheduled messages:\n"
+            query = {
+                "chat_id": chat_id,
+                "$or": [
+                    { "interval_seconds": { "$exists": True, "$ne": None, "$gt": 0 } },
+                    {
+                        "schedule_time": { "$exists": True, "$ne": None },
+                        "$or": [
+                            { "sent": False },
+                            { "sent": { "$exists": False } }
+                        ]
+                    }
+                ]
+            }
+            messages_cursor = self.collection.find(query)
+
+            # Convert cursor to list to avoid issues if we need to check if it's empty first
+            # or if admin check needs to happen before iterating.
+            # For now, admin check can be inside the loop.
+
+            keyboard_buttons = [] # Main list for all button rows
+            response_parts = ["**Scheduled Messages:**\n\n"] # Use a list to build the response string
             processed_count = 0
-            for msg in messages:
+
+            # Determine if the event sender is an admin once, before the loop
+            is_event_sender_admin = await self.is_admin(user_id, chat_id)
+
+            for msg_doc in messages_cursor:
                 try:
-                    schedule_name_display = msg.get('schedule_name', f"Unnamed (ID: {msg['_id']})")
+                    msg_id_str = str(msg_doc.get('_id'))
+                    schedule_name = msg_doc.get('schedule_name', f"Unnamed (ID: {msg_id_str})")
+                    message_text = msg_doc.get('message_text', '')
+                    message_text_preview = (message_text[:27] + "...") if len(message_text) > 30 else message_text
 
-                    # Robust time_info
-                    schedule_time = msg.get("schedule_time")
-                    interval_seconds = msg.get("interval_seconds")
+                    # Timing info
+                    schedule_time = msg_doc.get("schedule_time")
+                    interval_seconds = msg_doc.get("interval_seconds")
                     if schedule_time:
-                        time_info = f"Time: {schedule_time}"
+                        timing_info = f"One-time at {schedule_time}"
                     elif interval_seconds:
-                        time_info = f"Every {interval_seconds} seconds"
+                        timing_info = f"Repeats every {interval_seconds} seconds"
                     else:
-                        time_info = "Time: N/A"
+                        timing_info = "N/A"
 
-                    media_info = f" | Media: {msg.get('media_type', 'N/A')}" if msg.get("media_type") else ""
-                    buttons_list = msg.get('buttons', [])
-                    buttons_info = f" | Buttons: {', '.join([b.get('text', 'N/A') for b in buttons_list])}" if buttons_list else ""
+                    media_type = msg_doc.get('media_type')
+                    media_info = "Yes" if media_type else "No"
 
-                    current_msg_response = f"ID: {msg['_id']} | Name: {schedule_name_display} | {time_info} | Message: {msg.get('message_text', 'N/A')}{media_info}{buttons_info}\n"
-                    response += current_msg_response
-                    buttons.append([Button.inline(f"{schedule_name_display} (ID: {msg['_id']})", data=f"view_{msg['_id']}")])
-                    logger.info(f"Processed message for /list: {current_msg_response.strip()}")
+                    buttons_attached_list = msg_doc.get('buttons', [])
+                    buttons_attached_info = "Yes" if buttons_attached_list else "No"
+
+                    text_response_part = (
+                        f"**Name:** {schedule_name} (ID: `{msg_id_str}`)\n"
+                        f"**Text:** \"{message_text_preview}\"\n"
+                        f"**Timing:** {timing_info}\n"
+                        f"**Media Attached:** {media_info}, **Buttons Attached:** {buttons_attached_info}\n"
+                        "--------------------\n\n"
+                    )
+                    response_parts.append(text_response_part)
                     processed_count += 1
+                    logger.info(f"Formatting message for /list: ID {msg_id_str}, Name: {schedule_name}")
+
+                    # Button generation for admins
+                    if is_event_sender_admin:
+                        schedule_name_for_button = msg_doc.get('schedule_name', f"ID {msg_id_str}")
+                        max_button_text_len = 30 # Max length for button text to avoid Telegram errors
+                        button_text = f"Stop: {schedule_name_for_button}"
+                        if len(button_text) > max_button_text_len:
+                            button_text = button_text[:max_button_text_len-3] + "..."
+
+                        keyboard_buttons.append([Button.inline(button_text, data=f"stop_{msg_id_str}")])
+
                 except Exception as e_loop:
-                    logger.error(f"Error processing message {msg.get('_id', 'UNKNOWN_ID')} in /list loop: {e_loop}", exc_info=True)
-                    # Optionally, add a placeholder to the response indicating a message could not be displayed
-                    # response += f"ID: {msg.get('_id', 'UNKNOWN_ID')} | Name: Error displaying this schedule\n"
+                    logger.error(f"Error processing message document {msg_doc.get('_id', 'UNKNOWN_ID')} in /list loop: {e_loop}", exc_info=True)
+                    response_parts.append(f"Error displaying one schedule (ID: {msg_doc.get('_id', 'UNKNOWN_ID')}).\n--------------------\n\n")
 
 
-            if processed_count == 0: # Check based on actual processing, not just initial response string
-                await event.respond("No scheduled messages.")
-                return
+            if processed_count == 0:
                 await event.respond("No scheduled messages.")
                 return
 
-            await event.respond(response, buttons=buttons)
+            final_response = "".join(response_parts)
+            # Ensure the final response isn't too long for a single Telegram message
+            # Telegram message limit is 4096 characters.
+            if len(final_response) > 4096:
+                logger.warning(f"List schedule response too long ({len(final_response)} chars). Truncating.")
+                # A more sophisticated truncation or pagination would be better for production.
+                # For now, just truncate brutally.
+                final_response = final_response[:4090] + "\n... (list truncated)"
+
+            await event.respond(final_response, buttons=keyboard_buttons if keyboard_buttons else None)
+
         except Exception as e:
-            logger.error(f"Error in /list: {e}")
-            await event.respond("An error occurred.")
+            logger.error(f"Error in /list_schedules: {e}", exc_info=True)
+            await event.respond("An error occurred while fetching the list of schedules.")
 
     async def run(self):
         try:
