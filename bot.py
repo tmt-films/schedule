@@ -641,9 +641,9 @@ class MessageSchedulerBot:
                     feedback_message_parts.append("Encountered issues with some lines:")
                     feedback_message_parts.extend(errors_this_turn)
 
-                if not buttons_added_this_turn && not errors_this_turn: # e.g., user sent plain text that wasn't "skip"
+                if not buttons_added_this_turn and not errors_this_turn: # e.g., user sent plain text that wasn't "skip"
                     feedback_message_parts.append("No valid buttons found in your message. Please use 'text|url' format (one per line), or type 'skip'.")
-                elif not buttons_added_this_turn && errors_this_turn : # All lines had errors
+                elif not buttons_added_this_turn and errors_this_turn : # All lines had errors
                      feedback_message_parts.append("No buttons were added due to errors.")
 
 
